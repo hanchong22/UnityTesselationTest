@@ -18,9 +18,9 @@
 		_FresnelScale ("菲涅尔倍数", Range(0, 1)) = 0	
 		_FresnelBias("菲涅尔范围", Range(0, 2)) = 0
 
-		_TessEdgeLength( "镶嵌边长", Range( 2,50 ) ) = 5
+		_TessEdgeLength( "镶嵌边长，数值越小越精细", Range( 2,100 ) ) = 20
         _TessPhongStrength( "镶嵌Phong强度", Range( 0,1 ) ) = 0.5
-        _TessExtrusionAmount( "镶嵌扩张", Range( -1,1 ) ) = 0.0
+        _TessExtrusionAmount( "镶嵌扩张度", Range( -1,1 ) ) = 0.0
     }
 
 	CGINCLUDE
@@ -134,29 +134,17 @@
 			return o;
 		}
 
-		inline VertexInput _ds_VertexInput(UnityTessellationFactors tessFactors, const OutputPatch<InternalTessInterp_VertexInput, 3> vi, float3 bary : SV_DomainLocation)
-		{
-			VertexInput v;
-			v.vertex = vi[0].vertex*bary.x + vi[1].vertex*bary.y + vi[2].vertex*bary.z;		
-
-			half3 pp[3];
-			for (int i = 0; i < 3; ++i)
-				pp[i] = v.vertex.xyz - vi[i].normal * (dot(v.vertex.xyz, vi[i].normal) - dot(vi[i].vertex.xyz, vi[i].normal));
-
-			v.vertex.xyz = _TessPhongStrength * (pp[0] * bary.x + pp[1] * bary.y + pp[2] * bary.z) + (1.0f - _TessPhongStrength) * v.vertex.xyz;
-			v.tangent = vi[0].tangent*bary.x + vi[1].tangent*bary.y + vi[2].tangent*bary.z;
-			v.normal = vi[0].normal*bary.x + vi[1].normal*bary.y + vi[2].normal*bary.z;
-			v.vertex.xyz += v.normal.xyz * _TessExtrusionAmount;
-			v.texcoord0 = vi[0].uv*bary.x + vi[1].uv*bary.y + vi[2].uv*bary.z;
-			
-			return v;
-		}
+		
 
 
 		// 镶嵌常量外壳着色器（tessellation hull constant shader）
+		// 输出网格的镶嵌因子（tessallation factor）,输入为3个控制点
 		UnityTessellationFactors hsconst_VertexInput(InputPatch<InternalTessInterp_VertexInput, 3> v)
 		{
-			half4 tf = UnityEdgeLengthBasedTess(v[0].vertex, v[1].vertex, v[2].vertex, _TessEdgeLength);
+			//基于边长计算镶嵌因子
+			//UnityEdgeLengthBasedTessCull包含了超出视锥自动裁剪的功能，最后一个参数为超出多少距离就裁剪
+			half4 tf = UnityEdgeLengthBasedTessCull(v[0].vertex, v[1].vertex, v[2].vertex, _TessEdgeLength,0);
+			//镶嵌因子
 			UnityTessellationFactors o;
 			o.edge[0] = tf.x;
 			o.edge[1] = tf.y;
@@ -165,19 +153,33 @@
 			return o;
 		}
 
-		// 镶嵌外壳着色器（tessellation hull shader）
+		// 镶嵌控制点外壳着色器（tessellation hull shader），不做具体计算，仅充当传递着色器；InputPatch模板包含了面片所有控制点，系统值 SV_OutputControlPointID 为正在处理的控制点索引
+		// 注意：输出控制点与输入控制点不一定相同，多出来的控制点可由输入的控制点所衍生
+		//1、面片的类型，tri 为三角形，quad 为四边形， isoline 为等值线
 		[UNITY_domain("tri")]
+		//2、细分类型，integer为整数细分，会导致跳变；fractional_even/fractional_old为非整数类型
 		[UNITY_partitioning("fractional_odd")]
+		//3、通过细分所创建的三角形绕序,triangle_cw 顺针方向；Trangle_ccw 逆时针方向； line 针对线段曲面细分
 		[UNITY_outputtopology("triangle_cw")]
+		//4、指定的常量外壳着色器的函数名
 		[UNITY_patchconstantfunc("hsconst_VertexInput")]
-		[UNITY_outputcontrolpoints(3)]
+		//5、输出的控制点数量
+		[UNITY_outputcontrolpoints(3)]//3个控制点
+		//6、曲面细分因子的最大值（unity 似乎已经废弃此属性），directx11的最大值为64
+		//[UNITY_maxtessfactor(64)]
 		InternalTessInterp_VertexInput hs_VertexInput(InputPatch<InternalTessInterp_VertexInput, 3> v, uint id : SV_OutputControlPointID)
 		{
 			return v[id];
 		}
 
+		//原顶点着色器，输出值到片段着色器(将顶点投射到齐次裁剪空间)
 		VertexOutput vert (VertexInput v) {
-			VertexOutput o = (VertexOutput)0;			
+			VertexOutput o ;
+
+			//UNITY_SETUP_INSTANCE_ID(v);
+			//UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(o);
+			//UNITY_TRANSFER_INSTANCE_ID(v,   o);   
+
 			o.pos = UnityObjectToClipPos(v.vertex );
 		
 			o.uv.xy = v.texcoord0.xy * _MainTex_ST.xy + _MainTex_ST.zw;	
@@ -201,7 +203,28 @@
 			return o;
 		}
 
-		// 镶嵌域着色器(tessellation domain shader)
+		//镶嵌域着色器计算
+		inline VertexInput _ds_VertexInput(UnityTessellationFactors tessFactors, const OutputPatch<InternalTessInterp_VertexInput, 3> vi, float3 bary : SV_DomainLocation)
+		{
+			VertexInput v;
+			v.vertex = vi[0].vertex*bary.x + vi[1].vertex*bary.y + vi[2].vertex*bary.z;		
+
+			half3 pp[3];			
+			pp[0] = v.vertex.xyz - vi[0].normal * (dot(v.vertex.xyz, vi[0].normal) - dot(vi[0].vertex.xyz, vi[0].normal));
+			pp[1] = v.vertex.xyz - vi[1].normal * (dot(v.vertex.xyz, vi[1].normal) - dot(vi[1].vertex.xyz, vi[1].normal));
+			pp[2] = v.vertex.xyz - vi[2].normal * (dot(v.vertex.xyz, vi[2].normal) - dot(vi[2].vertex.xyz, vi[2].normal));
+
+			v.vertex.xyz = _TessPhongStrength * (pp[0] * bary.x + pp[1] * bary.y + pp[2] * bary.z) + (1.0f - _TessPhongStrength) * v.vertex.xyz;
+			v.tangent = vi[0].tangent*bary.x + vi[1].tangent*bary.y + vi[2].tangent*bary.z;
+			v.normal = vi[0].normal*bary.x + vi[1].normal*bary.y + vi[2].normal*bary.z;
+			v.vertex.xyz += v.normal.xyz * _TessExtrusionAmount;
+			v.texcoord0 = vi[0].uv*bary.x + vi[1].uv*bary.y + vi[2].uv*bary.z;
+			
+			return v;
+		}
+
+		//镶嵌域着色器(tessellation domain shader),输出值到片段着色器		
+		//1、面片类型：tri 表示三角形
 		[UNITY_domain("tri")]
 		VertexOutput ds_surf(UnityTessellationFactors tessFactors, const OutputPatch<InternalTessInterp_VertexInput, 3> vi, float3 bary : SV_DomainLocation)
 		{
@@ -254,7 +277,7 @@
     SubShader
     {
         Tags { "RenderType"="Opaque" }
-        LOD 100
+        LOD 500
 
         Pass
         {
